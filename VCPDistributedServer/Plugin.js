@@ -65,11 +65,14 @@ class PluginManager {
 
     async loadPlugins() {
         console.log('[DistPluginManager] Starting plugin discovery...');
+        console.log(`[DistPluginManager] Plugin directory: ${PLUGIN_DIR}`);
         this.plugins.clear();
 
         try {
             const pluginFolders = await fs.readdir(PLUGIN_DIR, { withFileTypes: true });
+            console.log(`[DistPluginManager] Found ${pluginFolders.length} items in Plugin directory`);
             for (const folder of pluginFolders) {
+                console.log(`[DistPluginManager] Checking folder: ${folder.name}, isDirectory: ${folder.isDirectory()}`);
                 if (folder.isDirectory()) {
                     const pluginPath = path.join(PLUGIN_DIR, folder.name);
                     const manifestPath = path.join(pluginPath, manifestFileName);
@@ -117,6 +120,8 @@ class PluginManager {
                 }
             }
             console.log(`[DistPluginManager] Plugin discovery finished. Loaded ${this.plugins.size} plugins.`);
+            const loadedPluginNames = Array.from(this.plugins.keys());
+            console.log(`[DistPluginManager] Successfully loaded plugins: ${loadedPluginNames.join(', ')}`);
             
             // 初始化静态插件
             await this.initializeStaticPlugins();
@@ -140,7 +145,10 @@ class PluginManager {
     async processToolCall(toolName, toolArgs) {
         const plugin = this.plugins.get(toolName);
         if (!plugin) {
-            throw new Error(`[DistPluginManager] Plugin "${toolName}" not found for tool call.`);
+            // 输出所有已加载的插件名称以便调试
+            const loadedPlugins = Array.from(this.plugins.keys());
+            console.error(`[DistPluginManager] Plugin "${toolName}" not found. Loaded plugins: ${loadedPlugins.join(', ')}`);
+            throw new Error(`[DistPluginManager] Plugin "${toolName}" not found for tool call. Available: ${loadedPlugins.join(', ')}`);
         }
 
         // --- 混合服务插件直接调用逻辑 ---
