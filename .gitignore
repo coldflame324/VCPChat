@@ -30,3 +30,6 @@ modules/settingsManager.js
 package-lock.json
 package.json
 styles/themes.cssbin/*.exe 
+bin/ffmpeg.exe
+bin/ffplay.exe
+bin/ffprobe.exe
