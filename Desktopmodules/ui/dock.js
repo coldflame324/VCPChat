@@ -2,6 +2,15 @@
 /**
  * VCPdesktop - Dock 栏系统模块
  * 负责：底部 Dock 栏渲染、快捷方式管理、拖拽到桌面、应用抽屉
+ *
+ * 图标体系（优先级从高到低）：
+ *   1. icon (PNG/SVG 文件路径) — 静态图标，默认显示
+ *   2. animatedIcon (GIF 文件路径) — 鼠标悬停时播放动画，移出恢复静态
+ *   3. svgIcon (内联 SVG 字符串) — AI 原生生成，支持 currentColor 主题适配
+ *   4. emoji (文字 emoji) — 最终回退
+ *
+ * 当只有 animatedIcon 无 icon 时，GIF 自身作为默认显示。
+ * svgIcon 仅在无 icon 和 animatedIcon 时使用，作为 AI 原生图标。
  */
 
 'use strict';
@@ -13,7 +22,16 @@
     let dockItemsContainer = null;
     let dockDrawer = null;
     let dockDrawerList = null;
+    let dockDrawerSearch = null;
     let isDrawerOpen = false;
+
+    // Dock 内部拖拽排序状态
+    let dragSortState = {
+        isDragging: false,
+        draggedIndex: -1,
+        draggedItemId: null,
+        dropTargetIndex: -1,
+    };
 
     // ============================================================
     // 初始化
@@ -27,8 +45,14 @@
         dockItemsContainer = document.getElementById('desktop-dock-items');
         dockDrawer = document.getElementById('desktop-dock-drawer');
         dockDrawerList = document.getElementById('desktop-dock-drawer-list');
+        dockDrawerSearch = document.getElementById('desktop-dock-drawer-search');
 
         if (!dockElement) return;
+
+        // 初始应用 Dock 位置
+        const pos = state.dock.position || 'bottom';
+        const dist = state.dock.edgeDistance ?? 12;
+        applyDockPosition(pos, dist);
 
         // 扫描按钮
         const scanBtn = document.getElementById('desktop-dock-scan-btn');
@@ -57,6 +81,17 @@
             });
         }
 
+        // 抽屉搜索框
+        if (dockDrawerSearch) {
+            dockDrawerSearch.addEventListener('input', () => {
+                renderDrawer(dockDrawerSearch.value.trim());
+            });
+            // 阻止搜索框的点击事件冒泡（防止关闭抽屉）
+            dockDrawerSearch.addEventListener('click', (e) => {
+                e.stopPropagation();
+            });
+        }
+
         // 点击抽屉外部关闭
         if (dockDrawer) {
             dockDrawer.addEventListener('click', (e) => {
@@ -68,6 +103,9 @@
 
         // 初始化拖拽接收（从外部拖入 .lnk 文件）
         initFileDrop();
+
+        // 初始化 Dock 内部拖拽排序
+        initDockSortDrag();
 
         // 加载已保存的 Dock 配置
         loadDockConfig();
@@ -85,18 +123,22 @@
 
         dockItemsContainer.innerHTML = '';
 
-        const visibleItems = state.dock.items.slice(0, state.dock.maxVisible);
+        // 只渲染标记为可见（visible !== false）的项目，最多显示 maxVisible 个
+        const visibleItems = state.dock.items.filter(item => item.visible !== false);
+        const displayItems = visibleItems.slice(0, state.dock.maxVisible);
 
-        visibleItems.forEach((item, index) => {
+        displayItems.forEach((item, index) => {
             const iconEl = createDockIcon(item, index);
             dockItemsContainer.appendChild(iconEl);
         });
 
-        // 更新"更多"按钮的可见性
+        // 更新"更多"按钮的可见性：有不可见的项或可见项超过 maxVisible 时显示
         const moreBtn = document.getElementById('desktop-dock-more-btn');
         if (moreBtn) {
-            moreBtn.style.display = state.dock.items.length > state.dock.maxVisible ? '' : 'none';
-            const hiddenCount = state.dock.items.length - state.dock.maxVisible;
+            const hasHidden = state.dock.items.some(item => item.visible === false) ||
+                              visibleItems.length > state.dock.maxVisible;
+            moreBtn.style.display = (state.dock.items.length > 0 && (hasHidden || state.dock.items.length > state.dock.maxVisible)) ? '' : 'none';
+            const hiddenCount = state.dock.items.length - displayItems.length;
             if (hiddenCount > 0) {
                 moreBtn.title = `还有 ${hiddenCount} 个应用`;
             }
@@ -125,18 +167,75 @@
         iconWrapper.title = item.description || item.name;
         iconWrapper.draggable = true;
 
-        // 图标
-        if (item.icon) {
+        // 图标渲染：icon(PNG/SVG文件) > animatedIcon(GIF) > svgIcon(内联SVG) > emoji
+        const displayIcon = item.icon || item.animatedIcon;
+        if (displayIcon) {
             const img = document.createElement('img');
-            img.src = item.icon;
+            img.src = displayIcon;
+            img.className = 'desktop-dock-icon-img';
+            img.draggable = false;
+            // 图标加载失败时回退到 svgIcon > emoji > 默认图标
+            img.onerror = function () {
+                if (item.svgIcon) {
+                    const svgEl = document.createElement('span');
+                    svgEl.className = 'desktop-dock-icon-svg';
+                    svgEl.innerHTML = item.svgIcon;
+                    this.replaceWith(svgEl);
+                } else if (item.emoji) {
+                    const emojiEl = document.createElement('span');
+                    emojiEl.className = 'desktop-dock-icon-emoji';
+                    emojiEl.textContent = item.emoji;
+                    this.replaceWith(emojiEl);
+                } else if (this.src !== new URL('../assets/setting.png', location.href).href) {
+                    this.src = '../assets/setting.png';
+                }
+            };
+            iconWrapper.appendChild(img);
+
+            // GIF 动画图标：hover 时播放，移出时恢复静态
+            if (item.animatedIcon) {
+                const preloadGif = new Image();
+                preloadGif.src = item.animatedIcon;
+                const staticSrc = item.icon || item.animatedIcon;
+
+                iconWrapper.addEventListener('mouseenter', () => {
+                    const imgEl = iconWrapper.querySelector('.desktop-dock-icon-img');
+                    if (imgEl) {
+                        imgEl.src = item.animatedIcon + '?t=' + Date.now();
+                    }
+                });
+                iconWrapper.addEventListener('mouseleave', () => {
+                    const imgEl = iconWrapper.querySelector('.desktop-dock-icon-img');
+                    if (imgEl) {
+                        imgEl.src = staticSrc;
+                    }
+                });
+            }
+        } else if (item.htmlIcon) {
+            // HTML 富图标（Shadow DOM 隔离渲染）
+            const htmlHost = document.createElement('span');
+            htmlHost.className = 'desktop-dock-icon-svg'; // 复用 SVG 容器样式
+            const shadow = htmlHost.attachShadow({ mode: 'closed' });
+            // 注入缩放约束：用包裹容器强制 HTML 图标内容缩放到指定尺寸
+            shadow.innerHTML = `<style>:host{display:block;width:100%;height:100%;overflow:hidden;}.vcp-html-icon-wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;transform-origin:center center;}</style><div class="vcp-html-icon-wrap">${item.htmlIcon}</div>`;
+            iconWrapper.appendChild(htmlHost);
+        } else if (item.svgIcon) {
+            // 内联 SVG 图标（AI 原生生成，支持 currentColor 主题适配）
+            const svgEl = document.createElement('span');
+            svgEl.className = 'desktop-dock-icon-svg';
+            svgEl.innerHTML = item.svgIcon;
+            iconWrapper.appendChild(svgEl);
+        } else if (item.emoji) {
+            const emojiEl = document.createElement('span');
+            emojiEl.className = 'desktop-dock-icon-emoji';
+            emojiEl.textContent = item.emoji;
+            iconWrapper.appendChild(emojiEl);
+        } else {
+            const img = document.createElement('img');
+            img.src = '../assets/setting.png';
             img.className = 'desktop-dock-icon-img';
             img.draggable = false;
             iconWrapper.appendChild(img);
-        } else {
-            const placeholder = document.createElement('span');
-            placeholder.className = 'desktop-dock-icon-placeholder';
-            placeholder.textContent = item.type === 'builtin' ? '📦' : '🔗';
-            iconWrapper.appendChild(placeholder);
         }
 
         // 名称标签
@@ -158,15 +257,28 @@
             showDockContextMenu(e.clientX, e.clientY, item, index);
         });
 
-        // 拖拽到桌面
+        // 拖拽：支持 Dock 内排序 + 拖到桌面
         iconWrapper.addEventListener('dragstart', (e) => {
             e.dataTransfer.setData('application/x-desktop-dock-item', JSON.stringify(item));
-            e.dataTransfer.effectAllowed = 'copy';
+            e.dataTransfer.setData('text/x-dock-sort-id', item.id);
+            e.dataTransfer.effectAllowed = 'copyMove';
             iconWrapper.classList.add('dragging');
+
+            // 设置拖拽排序状态
+            dragSortState.isDragging = true;
+            dragSortState.draggedIndex = index;
+            dragSortState.draggedItemId = item.id;
+            dragSortState.dropTargetIndex = -1;
         });
 
         iconWrapper.addEventListener('dragend', () => {
             iconWrapper.classList.remove('dragging');
+            // 清理排序状态和视觉反馈
+            cleanupDragSortIndicators();
+            dragSortState.isDragging = false;
+            dragSortState.draggedIndex = -1;
+            dragSortState.draggedItemId = null;
+            dragSortState.dropTargetIndex = -1;
         });
 
         // 鼓泡动画
@@ -184,6 +296,152 @@
     }
 
     // ============================================================
+    // Dock 内部拖拽排序
+    // ============================================================
+
+    /**
+     * 初始化 Dock 内部拖拽排序事件
+     */
+    function initDockSortDrag() {
+        if (!dockItemsContainer) return;
+
+        dockItemsContainer.addEventListener('dragover', (e) => {
+            // 只处理 Dock 内部排序（检查是否有排序标记）
+            if (!dragSortState.isDragging) return;
+            if (!e.dataTransfer.types.includes('text/x-dock-sort-id')) return;
+
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+
+            // 计算插入位置
+            const targetIndex = getDragOverIndex(e.clientX, e.clientY);
+            if (targetIndex !== dragSortState.dropTargetIndex) {
+                dragSortState.dropTargetIndex = targetIndex;
+                updateDragSortIndicators(targetIndex);
+            }
+        });
+
+        dockItemsContainer.addEventListener('drop', (e) => {
+            const sortId = e.dataTransfer.getData('text/x-dock-sort-id');
+            if (!sortId || !dragSortState.isDragging) return;
+
+            e.preventDefault();
+            e.stopPropagation(); // 防止冒泡到桌面 canvas 的 drop
+
+            const fromDisplayIndex = dragSortState.draggedIndex;
+            let toDisplayIndex = dragSortState.dropTargetIndex;
+
+            if (fromDisplayIndex < 0 || toDisplayIndex < 0 || fromDisplayIndex === toDisplayIndex) {
+                cleanupDragSortIndicators();
+                return;
+            }
+
+            // 将显示索引映射回 state.dock.items 中的实际索引
+            const visibleItems = state.dock.items.filter(item => item.visible !== false);
+            const displayItems = visibleItems.slice(0, state.dock.maxVisible);
+
+            if (fromDisplayIndex >= displayItems.length) {
+                cleanupDragSortIndicators();
+                return;
+            }
+
+            const movedItem = displayItems[fromDisplayIndex];
+            const fromActualIndex = state.dock.items.indexOf(movedItem);
+
+            if (fromActualIndex < 0) {
+                cleanupDragSortIndicators();
+                return;
+            }
+
+            // 计算目标位置在全量数组中的实际索引
+            let toActualIndex;
+            if (toDisplayIndex >= displayItems.length) {
+                // 插到显示列表末尾：找到最后一个可见项在全量数组中的位置之后
+                const lastVisibleItem = displayItems[displayItems.length - 1];
+                toActualIndex = state.dock.items.indexOf(lastVisibleItem) + 1;
+            } else {
+                // 插到某个可见项前面
+                const targetItem = displayItems[toDisplayIndex];
+                toActualIndex = state.dock.items.indexOf(targetItem);
+            }
+
+            // 执行排序：从数组中移除并插入到新位置
+            state.dock.items.splice(fromActualIndex, 1);
+            // 移除后索引可能需要调整
+            const adjustedTo = toActualIndex > fromActualIndex ? toActualIndex - 1 : toActualIndex;
+            state.dock.items.splice(adjustedTo, 0, movedItem);
+
+            renderDock();
+            saveDockConfig();
+
+            cleanupDragSortIndicators();
+        });
+
+        dockItemsContainer.addEventListener('dragleave', (e) => {
+            // 只在离开整个容器时清除指示器
+            if (!dockItemsContainer.contains(e.relatedTarget)) {
+                cleanupDragSortIndicators();
+                dragSortState.dropTargetIndex = -1;
+            }
+        });
+    }
+
+    /**
+     * 根据鼠标坐标计算拖拽插入位置索引（支持横向和纵向）
+     */
+    function getDragOverIndex(clientX, clientY) {
+        const icons = dockItemsContainer.querySelectorAll('.desktop-dock-icon');
+        if (icons.length === 0) return 0;
+
+        const pos = state.dock.position || 'bottom';
+        const isVertical = pos === 'left' || pos === 'right';
+
+        for (let i = 0; i < icons.length; i++) {
+            const rect = icons[i].getBoundingClientRect();
+            if (isVertical) {
+                const midY = rect.top + rect.height / 2;
+                if (clientY < midY) return i;
+            } else {
+                const midX = rect.left + rect.width / 2;
+                if (clientX < midX) return i;
+            }
+        }
+        return icons.length;
+    }
+
+    /**
+     * 更新拖拽排序的视觉指示器（插入线）
+     */
+    function updateDragSortIndicators(targetIndex) {
+        // 清除已有指示器
+        cleanupDragSortIndicators();
+
+        const icons = dockItemsContainer.querySelectorAll('.desktop-dock-icon');
+        if (icons.length === 0) return;
+
+        // 在目标位置创建插入线指示器
+        const indicator = document.createElement('div');
+        indicator.className = 'desktop-dock-sort-indicator';
+
+        if (targetIndex < icons.length) {
+            // 插到某个图标前面
+            icons[targetIndex].insertAdjacentElement('beforebegin', indicator);
+        } else {
+            // 插到末尾
+            dockItemsContainer.appendChild(indicator);
+        }
+    }
+
+    /**
+     * 清除所有拖拽排序指示器
+     */
+    function cleanupDragSortIndicators() {
+        if (!dockItemsContainer) return;
+        const indicators = dockItemsContainer.querySelectorAll('.desktop-dock-sort-indicator');
+        indicators.forEach(el => el.remove());
+    }
+
+    // ============================================================
     // 应用抽屉（App Drawer）
     // ============================================================
 
@@ -196,8 +454,18 @@
         isDrawerOpen = forceState !== undefined ? forceState : !isDrawerOpen;
 
         if (isDrawerOpen) {
+            // 清空搜索框并渲染全部应用
+            if (dockDrawerSearch) {
+                dockDrawerSearch.value = '';
+            }
             renderDrawer();
+            // 根据 Dock 位置调整抽屉对齐
+            updateDrawerPosition();
             dockDrawer.classList.add('open');
+            // 自动聚焦搜索框
+            setTimeout(() => {
+                if (dockDrawerSearch) dockDrawerSearch.focus();
+            }, 100);
         } else {
             dockDrawer.classList.remove('open');
         }
@@ -206,33 +474,85 @@
     /**
      * 渲染抽屉中的全部应用
      */
-    function renderDrawer() {
+    function renderDrawer(filter) {
         if (!dockDrawerList) return;
 
         dockDrawerList.innerHTML = '';
 
-        if (state.dock.items.length === 0) {
-            dockDrawerList.innerHTML = '<div class="desktop-dock-drawer-empty">暂无应用<br><span style="font-size:11px;opacity:0.5;">点击右下角扫描按钮导入桌面快捷方式</span></div>';
+        // 根据搜索关键词过滤
+        let items = state.dock.items;
+        if (filter) {
+            const lowerFilter = filter.toLowerCase();
+            items = items.filter(item => {
+                const nameMatch = item.name && item.name.toLowerCase().includes(lowerFilter);
+                const descMatch = item.description && item.description.toLowerCase().includes(lowerFilter);
+                const pathMatch = item.targetPath && item.targetPath.toLowerCase().includes(lowerFilter);
+                return nameMatch || descMatch || pathMatch;
+            });
+        }
+
+        if (items.length === 0) {
+            const emptyMsg = filter
+                ? `未找到匹配 "${filter}" 的应用`
+                : '暂无应用<br><span style="font-size:11px;opacity:0.5;">点击右下角扫描按钮导入桌面快捷方式</span>';
+            dockDrawerList.innerHTML = `<div class="desktop-dock-drawer-empty">${emptyMsg}</div>`;
             return;
         }
 
-        state.dock.items.forEach((item, index) => {
+        items.forEach((item, index) => {
             const card = document.createElement('div');
             card.className = 'desktop-dock-drawer-item';
             card.title = item.description || item.name;
 
-            // 图标
-            if (item.icon) {
+            // 图标渲染：icon(PNG/SVG文件) > animatedIcon(GIF) > svgIcon(内联SVG) > 默认
+            const drawerDisplayIcon = item.icon || item.animatedIcon;
+            if (drawerDisplayIcon) {
                 const img = document.createElement('img');
-                img.src = item.icon;
+                img.src = drawerDisplayIcon;
+                img.className = 'desktop-dock-drawer-item-icon';
+                img.draggable = false;
+                img.onerror = function () {
+                    if (item.svgIcon) {
+                        const svgEl = document.createElement('span');
+                        svgEl.className = 'desktop-dock-drawer-item-svg';
+                        svgEl.innerHTML = item.svgIcon;
+                        this.replaceWith(svgEl);
+                    } else if (this.src !== new URL('../assets/setting.png', location.href).href) {
+                        this.src = '../assets/setting.png';
+                    }
+                };
+                card.appendChild(img);
+            } else if (item.htmlIcon) {
+                const htmlHost = document.createElement('span');
+                htmlHost.className = 'desktop-dock-drawer-item-svg';
+                const shadow = htmlHost.attachShadow({ mode: 'closed' });
+                shadow.innerHTML = `<style>:host{display:block;width:100%;height:100%;overflow:hidden;}.vcp-html-icon-wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;transform-origin:center center;}</style><div class="vcp-html-icon-wrap">${item.htmlIcon}</div>`;
+                card.appendChild(htmlHost);
+            } else if (item.svgIcon) {
+                const svgEl = document.createElement('span');
+                svgEl.className = 'desktop-dock-drawer-item-svg';
+                svgEl.innerHTML = item.svgIcon;
+                card.appendChild(svgEl);
+            } else {
+                const img = document.createElement('img');
+                img.src = '../assets/setting.png';
                 img.className = 'desktop-dock-drawer-item-icon';
                 img.draggable = false;
                 card.appendChild(img);
-            } else {
-                const placeholder = document.createElement('span');
-                placeholder.className = 'desktop-dock-drawer-item-icon-placeholder';
-                placeholder.textContent = item.type === 'builtin' ? '📦' : '🔗';
-                card.appendChild(placeholder);
+            }
+
+            // GIF 动画图标：hover 时播放，移出时恢复静态
+            if (item.animatedIcon) {
+                const preloadGif = new Image();
+                preloadGif.src = item.animatedIcon;
+                const staticSrc = item.icon || item.animatedIcon;
+
+                card.addEventListener('mouseenter', () => {
+                    img.src = item.animatedIcon + '?t=' + Date.now();
+                });
+                card.addEventListener('mouseleave', () => {
+                    img.src = staticSrc;
+                });
             }
 
             // 名称
@@ -245,7 +565,7 @@
             const visCheck = document.createElement('input');
             visCheck.type = 'checkbox';
             visCheck.className = 'desktop-dock-drawer-item-check';
-            visCheck.checked = index < state.dock.maxVisible;
+            visCheck.checked = item.visible !== false;
             visCheck.title = '在 Dock 中显示';
             visCheck.addEventListener('click', (e) => {
                 e.stopPropagation();
@@ -264,7 +584,7 @@
             delBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 removeDockItem(item.id);
-                renderDrawer();
+                renderDrawer(dockDrawerSearch ? dockDrawerSearch.value.trim() : '');
             });
             card.appendChild(delBtn);
 
@@ -288,24 +608,10 @@
      * 处理抽屉中的可见性切换
      */
     function handleVisibilityToggle(item, currentIndex, shouldBeVisible) {
-        if (shouldBeVisible) {
-            // 如果当前不在可见范围内，将其移到可见区域末尾
-            if (currentIndex >= state.dock.maxVisible) {
-                // 把它从当前位置移出
-                state.dock.items.splice(currentIndex, 1);
-                // 插到 maxVisible - 1 处（可见区域末尾之前）
-                const insertAt = Math.min(state.dock.maxVisible - 1, state.dock.items.length);
-                state.dock.items.splice(insertAt, 0, item);
-            }
-        } else {
-            // 移到不可见区域
-            if (currentIndex < state.dock.maxVisible) {
-                state.dock.items.splice(currentIndex, 1);
-                state.dock.items.push(item);
-            }
-        }
+        // 直接设置 item 的 visible 属性，不再通过数组位置判断
+        item.visible = shouldBeVisible;
         renderDock();
-        renderDrawer();
+        renderDrawer(dockDrawerSearch ? dockDrawerSearch.value.trim() : '');
         saveDockConfig();
     }
 
@@ -335,6 +641,16 @@
             // 内置挂件 - 通过挂件系统生成
             if (item.builtinId && window.VCPDesktop[item.builtinId]) {
                 window.VCPDesktop[item.builtinId].spawn();
+            }
+            return;
+        }
+
+        // VChat 内部应用 - 通过 IPC 启动子窗口
+        if (item.type === 'vchat-app') {
+            if (window.VCPDesktop.vchatApps && window.VCPDesktop.vchatApps.launch) {
+                await window.VCPDesktop.vchatApps.launch(item);
+            } else {
+                console.warn('[Dock] VChat apps module not loaded');
             }
             return;
         }
@@ -389,6 +705,7 @@
             description: shortcut.description || '',
             originalPath: shortcut.originalPath || '',
             type: 'shortcut',
+            visible: true,
         };
 
         state.dock.items.push(item);
@@ -409,7 +726,7 @@
             );
             if (!existing) {
                 const id = `shortcut_${Date.now()}_${Math.random().toString(36).substr(2, 4)}_${addedCount}`;
-                state.dock.items.push({
+                const newItem = {
                     id,
                     name: sc.name,
                     icon: sc.icon || '',
@@ -419,7 +736,13 @@
                     description: sc.description || '',
                     originalPath: sc.originalPath || '',
                     type: 'shortcut',
-                });
+                    visible: true,
+                };
+                // 保留 URL 快捷方式标记（用于 steam:// 等协议链接的启动）
+                if (sc.isUrlShortcut) {
+                    newItem.isUrlShortcut = true;
+                }
+                state.dock.items.push(newItem);
                 addedCount++;
             }
         }
@@ -512,15 +835,16 @@
                 if (!files || files.length === 0) return;
 
                 e.preventDefault();
-                const lnkPaths = [];
+                const shortcutPaths = [];
                 for (let i = 0; i < files.length; i++) {
-                    if (files[i].name.toLowerCase().endsWith('.lnk')) {
-                        lnkPaths.push(files[i].path);
+                    const name = files[i].name.toLowerCase();
+                    if (name.endsWith('.lnk') || name.endsWith('.url')) {
+                        shortcutPaths.push(files[i].path);
                     }
                 }
 
-                if (lnkPaths.length > 0) {
-                    await importLnkFiles(lnkPaths);
+                if (shortcutPaths.length > 0) {
+                    await importLnkFiles(shortcutPaths);
                 }
             });
         }
@@ -554,16 +878,17 @@
                 // 处理外部 .lnk 文件拖入桌面
                 const files = e.dataTransfer.files;
                 if (files && files.length > 0) {
-                    const lnkPaths = [];
+                    const shortcutPaths = [];
                     for (let i = 0; i < files.length; i++) {
-                        if (files[i].name.toLowerCase().endsWith('.lnk')) {
-                            lnkPaths.push(files[i].path);
+                        const name = files[i].name.toLowerCase();
+                        if (name.endsWith('.lnk') || name.endsWith('.url')) {
+                            shortcutPaths.push(files[i].path);
                         }
                     }
-                    if (lnkPaths.length > 0) {
+                    if (shortcutPaths.length > 0) {
                         e.preventDefault();
                         // 先导入到 Dock
-                        const shortcuts = await importLnkFiles(lnkPaths);
+                        const shortcuts = await importLnkFiles(shortcutPaths);
                         // 同时在桌面上创建图标
                         if (shortcuts && shortcuts.length > 0) {
                             let offsetX = 0;
@@ -612,36 +937,109 @@
         const canvas = domRefs.canvas;
         if (!canvas) return;
 
-        // 检查是否已存在
-        const existingIcon = canvas.querySelector(`.desktop-shortcut-icon[data-target-path="${CSS.escape(item.targetPath)}"]`);
-        if (existingIcon) {
-            console.log(`[Dock] Desktop icon already exists: ${item.name}`);
-            return;
+        // 检查是否已存在（对 vchat-app 类型使用 id 去重，对快捷方式使用 targetPath 去重）
+        if (item.type === 'vchat-app') {
+            const existingIcon = canvas.querySelector(`.desktop-shortcut-icon[data-app-id="${CSS.escape(item.id)}"]`);
+            if (existingIcon) {
+                console.log(`[Dock] Desktop icon already exists: ${item.name}`);
+                return;
+            }
+        } else {
+            const existingIcon = canvas.querySelector(`.desktop-shortcut-icon[data-target-path="${CSS.escape(item.targetPath)}"]`);
+            if (existingIcon) {
+                console.log(`[Dock] Desktop icon already exists: ${item.name}`);
+                return;
+            }
         }
 
         const iconEl = document.createElement('div');
         iconEl.className = 'desktop-shortcut-icon';
-        iconEl.dataset.targetPath = item.targetPath || '';
-        iconEl.dataset.originalPath = item.originalPath || '';
+        if (item.type === 'vchat-app') {
+            iconEl.dataset.appId = item.id || '';
+            iconEl.dataset.appType = 'vchat-app';
+        } else {
+            iconEl.dataset.targetPath = item.targetPath || '';
+            iconEl.dataset.originalPath = item.originalPath || '';
+        }
 
-        // 定位
-        const adjustedX = Math.max(10, Math.min(x - 32, window.innerWidth - 80));
-        const adjustedY = Math.max(CONSTANTS.TITLE_BAR_HEIGHT + 4, Math.min(y - 32, window.innerHeight - 120));
+        // 定位（如果传入的是精确坐标 _exactPos=true，则跳过偏移调整）
+        let adjustedX, adjustedY;
+        if (item._exactPos) {
+            adjustedX = x;
+            adjustedY = y;
+        } else {
+            adjustedX = Math.max(10, Math.min(x - 32, window.innerWidth - 80));
+            adjustedY = Math.max(CONSTANTS.TITLE_BAR_HEIGHT + 4, Math.min(y - 32, window.innerHeight - 120));
+        }
         iconEl.style.left = `${adjustedX}px`;
         iconEl.style.top = `${adjustedY}px`;
 
-        // 图标图片
-        if (item.icon) {
+        // 图标渲染：icon(PNG/SVG文件) > animatedIcon(GIF) > svgIcon(内联SVG) > emoji
+        const desktopDisplayIcon = item.icon || item.animatedIcon;
+        if (desktopDisplayIcon) {
             const img = document.createElement('img');
-            img.src = item.icon;
+            img.src = desktopDisplayIcon;
+            img.className = 'desktop-shortcut-icon-img';
+            img.draggable = false;
+            // 图标加载失败时回退到 svgIcon > emoji > 默认图标
+            img.onerror = function () {
+                if (item.svgIcon) {
+                    const svgEl = document.createElement('span');
+                    svgEl.className = 'desktop-shortcut-icon-svg';
+                    svgEl.innerHTML = item.svgIcon;
+                    this.replaceWith(svgEl);
+                } else if (item.emoji) {
+                    const emojiEl = document.createElement('span');
+                    emojiEl.className = 'desktop-shortcut-icon-emoji';
+                    emojiEl.textContent = item.emoji;
+                    this.replaceWith(emojiEl);
+                } else if (this.src !== new URL('../assets/setting.png', location.href).href) {
+                    this.src = '../assets/setting.png';
+                }
+            };
+            iconEl.appendChild(img);
+
+            // GIF 动画图标：hover 时播放，移出时恢复静态
+            if (item.animatedIcon) {
+                const preloadGif = new Image();
+                preloadGif.src = item.animatedIcon;
+                const staticSrc = item.icon || item.animatedIcon;
+
+                iconEl.addEventListener('mouseenter', () => {
+                    const imgEl = iconEl.querySelector('.desktop-shortcut-icon-img');
+                    if (imgEl) {
+                        imgEl.src = item.animatedIcon + '?t=' + Date.now();
+                    }
+                });
+                iconEl.addEventListener('mouseleave', () => {
+                    const imgEl = iconEl.querySelector('.desktop-shortcut-icon-img');
+                    if (imgEl) {
+                        imgEl.src = staticSrc;
+                    }
+                });
+            }
+        } else if (item.htmlIcon) {
+            const htmlHost = document.createElement('span');
+            htmlHost.className = 'desktop-shortcut-icon-svg';
+            const shadow = htmlHost.attachShadow({ mode: 'closed' });
+            shadow.innerHTML = `<style>:host{display:block;width:100%;height:100%;overflow:hidden;}.vcp-html-icon-wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;transform-origin:center center;}</style><div class="vcp-html-icon-wrap">${item.htmlIcon}</div>`;
+            iconEl.appendChild(htmlHost);
+        } else if (item.svgIcon) {
+            const svgEl = document.createElement('span');
+            svgEl.className = 'desktop-shortcut-icon-svg';
+            svgEl.innerHTML = item.svgIcon;
+            iconEl.appendChild(svgEl);
+        } else if (item.emoji) {
+            const emojiEl = document.createElement('span');
+            emojiEl.className = 'desktop-shortcut-icon-emoji';
+            emojiEl.textContent = item.emoji;
+            iconEl.appendChild(emojiEl);
+        } else {
+            const img = document.createElement('img');
+            img.src = '../assets/setting.png';
             img.className = 'desktop-shortcut-icon-img';
             img.draggable = false;
             iconEl.appendChild(img);
-        } else {
-            const placeholder = document.createElement('span');
-            placeholder.className = 'desktop-shortcut-icon-placeholder';
-            placeholder.textContent = '🔗';
-            iconEl.appendChild(placeholder);
         }
 
         // 标签
@@ -681,19 +1079,29 @@
 
         canvas.appendChild(iconEl);
 
-        // 保存到状态
+        // 保存到状态（保留完整的图标信息，确保预设恢复时图标不丢失）
         const iconState = {
             id: item.id || `dicon_${Date.now()}`,
             name: item.name,
             icon: item.icon,
+            animatedIcon: item.animatedIcon || null,
+            svgIcon: item.svgIcon || null,
+            htmlIcon: item.htmlIcon || null,
+            emoji: item.emoji || null,
             targetPath: item.targetPath,
             args: item.args,
             workingDir: item.workingDir,
             originalPath: item.originalPath,
+            description: item.description || '',
+            type: item.type || 'shortcut',
+            appAction: item.appAction || null,
             x: adjustedX,
             y: adjustedY,
         };
         state.desktopIcons.push(iconState);
+
+        // 自动保存桌面图标布局
+        saveDesktopIconsDebounced();
 
         // 进入动画
         iconEl.classList.add('entering');
@@ -735,13 +1143,26 @@
                 document.removeEventListener('mouseup', onUp);
                 if (isDragging) {
                     iconEl.classList.remove('dragging');
+
+                    // 网格对齐吸附
+                    if (state.globalSettings?.desktopIcon?.gridSnap) {
+                        snapToGrid(iconEl);
+                    }
+
                     // 更新状态中的位置
                     const targetPath = iconEl.dataset.targetPath;
-                    const iconState = state.desktopIcons.find(i => i.targetPath === targetPath);
+                    const appId = iconEl.dataset.appId;
+                    const iconState = state.desktopIcons.find(i =>
+                        (targetPath && i.targetPath === targetPath) ||
+                        (appId && i.id === appId)
+                    );
                     if (iconState) {
                         iconState.x = parseInt(iconEl.style.left) || 0;
                         iconState.y = parseInt(iconEl.style.top) || 0;
                     }
+
+                    // 自动保存桌面图标布局
+                    saveDesktopIconsDebounced();
                 }
             };
 
@@ -764,8 +1185,11 @@
 
         dockContextMenu = document.createElement('div');
         dockContextMenu.className = 'desktop-context-menu visible';
+
+        // 先添加到 DOM 以便计算尺寸
         dockContextMenu.style.left = `${x}px`;
         dockContextMenu.style.top = `${y}px`;
+        dockContextMenu.style.visibility = 'hidden';
 
         const launchBtn = document.createElement('button');
         launchBtn.className = 'desktop-context-menu-item';
@@ -787,6 +1211,44 @@
         });
         dockContextMenu.appendChild(toDesktopBtn);
 
+        // 更换图标
+        const changeIconBtn = document.createElement('button');
+        changeIconBtn.className = 'desktop-context-menu-item';
+        changeIconBtn.textContent = '🎨 更换图标';
+        changeIconBtn.addEventListener('click', () => {
+            dockContextMenu.remove();
+            dockContextMenu = null;
+            if (window.VCPDesktop.iconPicker) {
+                window.VCPDesktop.iconPicker.open((iconData) => {
+                    const stateItem = state.dock.items.find(i => i.id === item.id);
+                    // 根据图标类型更新不同字段
+                    if (iconData.iconType === 'html' && iconData.htmlContent) {
+                        // HTML 图标：清除其他图标字段，设置 htmlIcon
+                        if (stateItem) {
+                            stateItem.icon = null;
+                            stateItem.htmlIcon = iconData.htmlContent;
+                        }
+                        item.icon = null;
+                        item.htmlIcon = iconData.htmlContent;
+                        // 同步更新桌面上的同源图标 DOM
+                        updateDesktopIconsByTargetHtml(item.targetPath, iconData.htmlContent);
+                    } else {
+                        // 图片/SVG/GIF 图标：使用 dataUrl
+                        if (stateItem) {
+                            stateItem.icon = iconData.dataUrl;
+                            stateItem.htmlIcon = null;
+                        }
+                        item.icon = iconData.dataUrl;
+                        item.htmlIcon = null;
+                        updateDesktopIconsByTarget(item.targetPath, iconData.dataUrl);
+                    }
+                    renderDock();
+                    saveDockConfig();
+                });
+            }
+        });
+        dockContextMenu.appendChild(changeIconBtn);
+
         const divider = document.createElement('div');
         divider.className = 'desktop-context-menu-divider';
         dockContextMenu.appendChild(divider);
@@ -802,6 +1264,29 @@
         dockContextMenu.appendChild(removeBtn);
 
         document.body.appendChild(dockContextMenu);
+
+        // 边界避让：防止菜单超出窗口
+        requestAnimationFrame(() => {
+            if (!dockContextMenu) return;
+            const rect = dockContextMenu.getBoundingClientRect();
+            let adjustedX = x;
+            let adjustedY = y;
+            // 底部避让
+            if (rect.bottom > window.innerHeight - 10) {
+                adjustedY = y - rect.height;
+            }
+            // 右侧避让
+            if (rect.right > window.innerWidth - 10) {
+                adjustedX = x - rect.width;
+            }
+            // 顶部避让
+            if (adjustedY < 10) {
+                adjustedY = 10;
+            }
+            dockContextMenu.style.left = `${adjustedX}px`;
+            dockContextMenu.style.top = `${adjustedY}px`;
+            dockContextMenu.style.visibility = '';
+        });
 
         // 点击其他地方关闭
         const closeHandler = (e) => {
@@ -826,6 +1311,7 @@
         dockContextMenu.className = 'desktop-context-menu visible';
         dockContextMenu.style.left = `${x}px`;
         dockContextMenu.style.top = `${y}px`;
+        dockContextMenu.style.visibility = 'hidden';
 
         const launchBtn = document.createElement('button');
         launchBtn.className = 'desktop-context-menu-item';
@@ -836,6 +1322,63 @@
             launchDockItem(item);
         });
         dockContextMenu.appendChild(launchBtn);
+
+        // 更换图标
+        const changeIconBtn = document.createElement('button');
+        changeIconBtn.className = 'desktop-context-menu-item';
+        changeIconBtn.textContent = '🎨 更换图标';
+        changeIconBtn.addEventListener('click', () => {
+            dockContextMenu.remove();
+            dockContextMenu = null;
+            if (window.VCPDesktop.iconPicker) {
+                window.VCPDesktop.iconPicker.open((iconData) => {
+                    const targetPath = iconEl.dataset.targetPath;
+                    const appId = iconEl.dataset.appId;
+                    if (iconData.iconType === 'html' && iconData.htmlContent) {
+                        // HTML 图标：替换桌面图标 DOM 中的图标元素
+                        item.icon = null;
+                        item.htmlIcon = iconData.htmlContent;
+                        // 更新 state
+                        const iconState = state.desktopIcons.find(i =>
+                            (targetPath && i.targetPath === targetPath) ||
+                            (appId && i.id === appId)
+                        );
+                        if (iconState) { iconState.icon = null; iconState.htmlIcon = iconData.htmlContent; }
+                        // 替换当前桌面图标 DOM 中的图标元素
+                        replaceDesktopIconElement(iconEl, 'html', iconData.htmlContent);
+                        // 同步 Dock
+                        const dockItem = state.dock.items.find(i =>
+                            (targetPath && i.targetPath === targetPath) ||
+                            (appId && i.id === appId)
+                        );
+                        if (dockItem) { dockItem.icon = null; dockItem.htmlIcon = iconData.htmlContent; renderDock(); saveDockConfig(); }
+                        // 自动保存桌面图标布局
+                        saveDesktopIconsDebounced();
+                    } else {
+                        // 图片/SVG/GIF：替换桌面图标 DOM 中的图标元素
+                        item.icon = iconData.dataUrl;
+                        item.htmlIcon = null;
+                        // 更新 state
+                        const iconState = state.desktopIcons.find(i =>
+                            (targetPath && i.targetPath === targetPath) ||
+                            (appId && i.id === appId)
+                        );
+                        if (iconState) { iconState.icon = iconData.dataUrl; iconState.htmlIcon = null; }
+                        // 替换当前桌面图标 DOM 中的图标元素
+                        replaceDesktopIconElement(iconEl, 'image', iconData.dataUrl);
+                        // 同步 Dock
+                        const dockItem = state.dock.items.find(i =>
+                            (targetPath && i.targetPath === targetPath) ||
+                            (appId && i.id === appId)
+                        );
+                        if (dockItem) { dockItem.icon = iconData.dataUrl; dockItem.htmlIcon = null; renderDock(); saveDockConfig(); }
+                        // 自动保存桌面图标布局
+                        saveDesktopIconsDebounced();
+                    }
+                });
+            }
+        });
+        dockContextMenu.appendChild(changeIconBtn);
 
         const divider = document.createElement('div');
         divider.className = 'desktop-context-menu-divider';
@@ -851,14 +1394,40 @@
             iconEl.addEventListener('animationend', () => {
                 iconEl.remove();
                 // 从状态中移除
-                const targetPath = iconEl.dataset.targetPath;
-                const idx = state.desktopIcons.findIndex(i => i.targetPath === targetPath);
+                const rmTargetPath = iconEl.dataset.targetPath;
+                const rmAppId = iconEl.dataset.appId;
+                const idx = state.desktopIcons.findIndex(i =>
+                    (rmTargetPath && i.targetPath === rmTargetPath) ||
+                    (rmAppId && i.id === rmAppId)
+                );
                 if (idx >= 0) state.desktopIcons.splice(idx, 1);
+                // 自动保存桌面图标布局
+                saveDesktopIconsDebounced();
             }, { once: true });
         });
         dockContextMenu.appendChild(removeBtn);
 
         document.body.appendChild(dockContextMenu);
+
+        // 边界避让：防止菜单超出窗口
+        requestAnimationFrame(() => {
+            if (!dockContextMenu) return;
+            const rect = dockContextMenu.getBoundingClientRect();
+            let adjustedX = x;
+            let adjustedY = y;
+            if (rect.bottom > window.innerHeight - 10) {
+                adjustedY = y - rect.height;
+            }
+            if (rect.right > window.innerWidth - 10) {
+                adjustedX = x - rect.width;
+            }
+            if (adjustedY < 10) {
+                adjustedY = 10;
+            }
+            dockContextMenu.style.left = `${adjustedX}px`;
+            dockContextMenu.style.top = `${adjustedY}px`;
+            dockContextMenu.style.visibility = '';
+        });
 
         const closeHandler = (e) => {
             if (dockContextMenu && !dockContextMenu.contains(e.target)) {
@@ -900,12 +1469,323 @@
             const result = await window.electronAPI.desktopLoadDock();
             if (result?.success && result.data) {
                 state.dock.items = result.data.items || [];
+                // 兼容旧数据：没有 visible 字段的 item 根据原来的位置逻辑设置默认值
                 state.dock.maxVisible = result.data.maxVisible || 8;
+                state.dock.items.forEach((item, index) => {
+                    if (item.visible === undefined) {
+                        // 旧数据迁移：前 maxVisible 个默认可见，其余不可见
+                        item.visible = index < state.dock.maxVisible;
+                    }
+                });
                 renderDock();
                 console.log(`[Dock] Config loaded: ${state.dock.items.length} items`);
             }
         } catch (err) {
             console.error('[Dock] Load config error:', err);
+        }
+    }
+
+    // ============================================================
+    // 图标同步更新辅助
+    // ============================================================
+
+    /**
+     * 更新桌面上所有同源（相同 targetPath）图标的显示（图片类型）
+     */
+    function updateDesktopIconsByTarget(targetPath, newIconSrc) {
+        if (!targetPath) return;
+        const canvas = domRefs.canvas;
+        if (!canvas) return;
+
+        const icons = canvas.querySelectorAll(`.desktop-shortcut-icon[data-target-path="${CSS.escape(targetPath)}"]`);
+        icons.forEach(iconEl => {
+            replaceDesktopIconElement(iconEl, 'image', newIconSrc);
+        });
+
+        // 同步状态
+        state.desktopIcons.forEach(iconState => {
+            if (iconState.targetPath === targetPath) {
+                iconState.icon = newIconSrc;
+                iconState.htmlIcon = null;
+            }
+        });
+
+        // 自动保存桌面图标布局
+        saveDesktopIconsDebounced();
+    }
+
+    /**
+     * 更新桌面上所有同源（相同 targetPath）图标的显示（HTML 类型）
+     */
+    function updateDesktopIconsByTargetHtml(targetPath, htmlContent) {
+        if (!targetPath) return;
+        const canvas = domRefs.canvas;
+        if (!canvas) return;
+
+        const icons = canvas.querySelectorAll(`.desktop-shortcut-icon[data-target-path="${CSS.escape(targetPath)}"]`);
+        icons.forEach(iconEl => {
+            replaceDesktopIconElement(iconEl, 'html', htmlContent);
+        });
+
+        // 同步状态
+        state.desktopIcons.forEach(iconState => {
+            if (iconState.targetPath === targetPath) {
+                iconState.icon = null;
+                iconState.htmlIcon = htmlContent;
+            }
+        });
+
+        // 自动保存桌面图标布局
+        saveDesktopIconsDebounced();
+    }
+
+    /**
+     * 替换桌面图标 DOM 中的图标元素（支持 image/html 类型切换）
+     * @param {HTMLElement} iconEl - 桌面图标容器 (.desktop-shortcut-icon)
+     * @param {string} type - 'image' | 'html'
+     * @param {string} content - dataUrl (image) 或 htmlContent (html)
+     */
+    function replaceDesktopIconElement(iconEl, type, content) {
+        // 移除旧的图标元素（img / span.desktop-shortcut-icon-svg / span.desktop-shortcut-icon-emoji）
+        const oldImg = iconEl.querySelector('.desktop-shortcut-icon-img');
+        const oldSvg = iconEl.querySelector('.desktop-shortcut-icon-svg');
+        const oldEmoji = iconEl.querySelector('.desktop-shortcut-icon-emoji');
+        const oldPlaceholder = iconEl.querySelector('.desktop-shortcut-icon-placeholder');
+        if (oldImg) oldImg.remove();
+        if (oldSvg) oldSvg.remove();
+        if (oldEmoji) oldEmoji.remove();
+        if (oldPlaceholder) oldPlaceholder.remove();
+
+        // 在 label 之前插入新图标元素
+        const label = iconEl.querySelector('.desktop-shortcut-icon-label');
+
+        if (type === 'html') {
+            const htmlHost = document.createElement('span');
+            htmlHost.className = 'desktop-shortcut-icon-svg';
+            const shadow = htmlHost.attachShadow({ mode: 'closed' });
+            shadow.innerHTML = `<style>:host{display:block;width:100%;height:100%;overflow:hidden;}.vcp-html-icon-wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;transform-origin:center center;}</style><div class="vcp-html-icon-wrap">${content}</div>`;
+            if (label) {
+                iconEl.insertBefore(htmlHost, label);
+            } else {
+                iconEl.appendChild(htmlHost);
+            }
+        } else {
+            // image 类型
+            const img = document.createElement('img');
+            img.src = content;
+            img.className = 'desktop-shortcut-icon-img';
+            img.draggable = false;
+            img.onerror = function () {
+                if (this.src !== new URL('../assets/setting.png', location.href).href) {
+                    this.src = '../assets/setting.png';
+                }
+            };
+            if (label) {
+                iconEl.insertBefore(img, label);
+            } else {
+                iconEl.appendChild(img);
+            }
+        }
+    }
+
+    // ============================================================
+    // Dock 四向定位
+    // ============================================================
+
+    /**
+     * 应用 Dock 的位置和边缘距离
+     * @param {string} position - 'top' | 'bottom' | 'left' | 'right'
+     * @param {number} edgeDistance - 边缘距离 (px)
+     */
+    function applyDockPosition(position, edgeDistance) {
+        if (!dockElement) return;
+
+        const pos = position || 'bottom';
+        const dist = edgeDistance ?? 12;
+
+        // 清除所有方向类
+        dockElement.classList.remove('dock-top', 'dock-bottom', 'dock-left', 'dock-right');
+        dockElement.classList.add(`dock-${pos}`);
+
+        // 重置所有定位属性（使用 'auto' 覆盖 CSS 默认值，避免 top+bottom 同时生效导致铺满）
+        dockElement.style.top = 'auto';
+        dockElement.style.bottom = 'auto';
+        dockElement.style.left = 'auto';
+        dockElement.style.right = 'auto';
+        dockElement.style.transform = 'none';
+
+        // 根据位置设置定位
+        switch (pos) {
+            case 'top':
+                dockElement.style.top = `${dist}px`;
+                dockElement.style.left = '50%';
+                dockElement.style.transform = 'translateX(-50%)';
+                dockElement.style.flexDirection = 'row';
+                if (dockItemsContainer) dockItemsContainer.style.flexDirection = 'row';
+                break;
+            case 'bottom':
+                dockElement.style.bottom = `${dist}px`;
+                dockElement.style.left = '50%';
+                dockElement.style.transform = 'translateX(-50%)';
+                dockElement.style.flexDirection = 'row';
+                if (dockItemsContainer) dockItemsContainer.style.flexDirection = 'row';
+                break;
+            case 'left':
+                dockElement.style.left = `${dist}px`;
+                dockElement.style.top = '50%';
+                dockElement.style.transform = 'translateY(-50%)';
+                dockElement.style.flexDirection = 'column';
+                if (dockItemsContainer) dockItemsContainer.style.flexDirection = 'column';
+                break;
+            case 'right':
+                dockElement.style.right = `${dist}px`;
+                dockElement.style.top = '50%';
+                dockElement.style.transform = 'translateY(-50%)';
+                dockElement.style.flexDirection = 'column';
+                if (dockItemsContainer) dockItemsContainer.style.flexDirection = 'column';
+                break;
+        }
+
+        // 更新运行时状态
+        state.dock.position = pos;
+        state.dock.edgeDistance = dist;
+
+        // 更新抽屉位置
+        updateDrawerPosition();
+    }
+
+    /**
+     * 根据 Dock 位置更新抽屉面板的对齐方式
+     */
+    function updateDrawerPosition() {
+        if (!dockDrawer) return;
+        const pos = state.dock.position || 'bottom';
+
+        // 清除旧的定位类
+        dockDrawer.classList.remove('drawer-from-top', 'drawer-from-bottom', 'drawer-from-left', 'drawer-from-right');
+        dockDrawer.classList.add(`drawer-from-${pos}`);
+    }
+
+    // ============================================================
+    // 桌面图标网格吸附
+    // ============================================================
+
+    /**
+     * 将桌面图标吸附到最近的网格位置
+     * @param {HTMLElement} iconEl - 桌面图标 DOM 元素
+     */
+    function snapToGrid(iconEl) {
+        const iconSize = state.globalSettings?.desktopIcon?.iconSize || 40;
+        // 网格单元尺寸 = 图标容器宽度（iconSize + 32px padding）+ 间距
+        const cellW = iconSize + 40;  // 水平单元（含间距）
+        const cellH = iconSize + 52;  // 垂直单元（含标签 + 间距）
+        const padLeft = 16;           // 左侧起始边距
+        const padTop = 42;            // 顶部起始边距（标题栏下方）
+
+        let x = parseInt(iconEl.style.left) || 0;
+        let y = parseInt(iconEl.style.top) || 0;
+
+        // 计算最近的网格位置
+        const col = Math.max(0, Math.round((x - padLeft) / cellW));
+        const row = Math.max(0, Math.round((y - padTop) / cellH));
+
+        const snapX = col * cellW + padLeft;
+        const snapY = row * cellH + padTop;
+
+        // 平滑吸附动画
+        iconEl.style.transition = 'left 0.15s ease, top 0.15s ease';
+        iconEl.style.left = `${snapX}px`;
+        iconEl.style.top = `${snapY}px`;
+
+        // 动画结束后移除 transition 避免影响后续拖拽
+        setTimeout(() => {
+            iconEl.style.transition = '';
+        }, 160);
+    }
+
+    // ============================================================
+    // 桌面图标持久化（自动保存/恢复）
+    // ============================================================
+
+    let _saveDesktopIconsTimer = null;
+
+    /**
+     * 防抖保存桌面图标（避免频繁写入）
+     */
+    function saveDesktopIconsDebounced() {
+        // 恢复期间不自动保存（避免数据翻倍）
+        if (_isRestoringIcons) return;
+        if (_saveDesktopIconsTimer) clearTimeout(_saveDesktopIconsTimer);
+        _saveDesktopIconsTimer = setTimeout(() => {
+            saveDesktopIcons();
+        }, 800);
+    }
+
+    /**
+     * 保存桌面图标到 layout.json 的 desktopIcons 字段
+     */
+    async function saveDesktopIcons() {
+        if (!window.electronAPI?.desktopSaveLayout || !window.electronAPI?.desktopLoadLayout) return;
+
+        try {
+            const result = await window.electronAPI.desktopLoadLayout();
+            const layoutData = (result?.success && result.data) ? result.data : {};
+            // 保存到 currentDesktopIcons 字段（清除旧的 desktopIcons 避免混淆）
+            layoutData.currentDesktopIcons = state.desktopIcons.map(icon => {
+                const copy = {...icon};
+                delete copy._exactPos; // 清除临时标记
+                return copy;
+            });
+            delete layoutData.desktopIcons; // 清除旧字段
+            await window.electronAPI.desktopSaveLayout(layoutData);
+            console.log(`[Dock] Desktop icons saved: ${state.desktopIcons.length} icons`);
+        } catch (err) {
+            console.error('[Dock] Save desktop icons error:', err);
+        }
+    }
+
+    /** 是否正在恢复桌面图标（恢复期间不触发自动保存） */
+    let _isRestoringIcons = false;
+
+    /**
+     * 从 layout.json 恢复桌面图标
+     */
+    async function restoreDesktopIcons() {
+        if (!window.electronAPI?.desktopLoadLayout) return;
+
+        try {
+            const result = await window.electronAPI.desktopLoadLayout();
+            if (!result?.success || !result.data) return;
+
+            // 支持两个字段名：currentDesktopIcons（新）和 desktopIcons（旧兼容）
+            const savedIcons = result.data.currentDesktopIcons || result.data.desktopIcons;
+            if (!Array.isArray(savedIcons) || savedIcons.length === 0) return;
+
+            console.log(`[Dock] Restoring ${savedIcons.length} desktop icons...`);
+
+            // 标记恢复中，禁止自动保存
+            _isRestoringIcons = true;
+
+            // 清空当前桌面图标状态
+            state.desktopIcons = [];
+
+            // 清除画布上现有的桌面图标 DOM
+            const canvas = domRefs.canvas;
+            if (canvas) {
+                canvas.querySelectorAll('.desktop-shortcut-icon').forEach(el => el.remove());
+            }
+
+            for (const iconData of savedIcons) {
+                // 使用 _exactPos 标记精确坐标（跳过 createDesktopIcon 内部的偏移调整）
+                iconData._exactPos = true;
+                createDesktopIcon(iconData, iconData.x || 100, iconData.y || 100);
+            }
+
+            _isRestoringIcons = false;
+            console.log(`[Dock] Desktop icons restored: ${state.desktopIcons.length}`);
+        } catch (err) {
+            _isRestoringIcons = false;
+            console.error('[Dock] Restore desktop icons error:', err);
         }
     }
 
@@ -925,6 +1805,9 @@
         saveDockConfig,
         loadDockConfig,
         createDesktopIcon,
+        applyPosition: applyDockPosition,
+        restoreDesktopIcons,
+        saveDesktopIcons,
     };
 
 })();
